@@ -1,8 +1,0 @@
-{
-    "input_dim": 20,
-    "hidden_dims": [192, 96, 48],
-    "dropout": 0.45,
-    "version": "1.0",
-    "date": "2026-12-01",
-    "description": "LIGHTCURE RFA Model - 20 features"
-}
