@@ -1,0 +1,43 @@
+{
+  "input_dim": 11,
+  "preop_dim": 11,
+  "postop_dim": 0,
+  "hidden_dims": [
+    192,
+    96,
+    48
+  ],
+  "dropout": 0.45,
+  "preop_vars": [
+    "us_well_defined_margin_preop",
+    "Etiology",
+    "us_enlarged_lymph_nodes_preop",
+    "DWI_High_preop",
+    "Restricted_Diffusion_preop",
+    "Arterial_Enhancement_preop",
+    "location",
+    "us_gallbladder_invasion_preop",
+    "Margin_Ill_Defined_preop",
+    "Number_of_lesions",
+    "Maximum_diameter"
+  ],
+  "postop_vars": [],
+  "all_vars": [
+    "us_well_defined_margin_preop",
+    "Etiology",
+    "us_enlarged_lymph_nodes_preop",
+    "DWI_High_preop",
+    "Restricted_Diffusion_preop",
+    "Arterial_Enhancement_preop",
+    "location",
+    "us_gallbladder_invasion_preop",
+    "Margin_Ill_Defined_preop",
+    "Number_of_lesions",
+    "Maximum_diameter"
+  ],
+  "best_val_auc": 0.9236062440267602,
+  "p_train_event": 0.10562270099842354,
+  "p_val_event": 0.1053921568627451,
+  "p_ext1_event": 0.19182948490230906,
+  "p_ext2_event": 0.06924315619967794
+}

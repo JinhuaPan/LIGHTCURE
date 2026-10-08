@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-LIGHTCURE - 肝细胞癌消融治疗决策支持系统
-公开平台部署 - Streamlit应用
+LIGHTCURE - 术后动态监测决策支持系统（v4）
+========================================
+后端：术后动态模型（T0 / T1 / T3）
+- T0: 术前 11 + IHC
+- T1: 术前 11 + 术后 3 月变量 + IHC
+- T3: 术前 11 + 术后 3 月 + 6 月变量 + IHC
 
-修复：IHC特征不经过标准化，直接拼接
+IHC 和术后变量都允许缺失（走缺失嵌入）。
 """
 
 import streamlit as st
@@ -12,136 +16,85 @@ import numpy as np
 import torch
 import torch.nn as nn
 import pickle
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.preprocessing import StandardScaler
-import shap
 import io
-import base64
 from datetime import datetime
 import warnings
 import os
 import json
-import hashlib
+
 warnings.filterwarnings('ignore')
 
 # ============================================================================
 # 页面配置
 # ============================================================================
 st.set_page_config(
-    page_title="LIGHTCURE - HCC Ablation Decision Support System",
+    page_title="LIGHTCURE - Postoperative Dynamic Monitoring",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ============================================================================
-# 全局样式
-# ============================================================================
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #1a5276;
-        text-align: center;
-        padding: 1rem 0;
-        border-bottom: 3px solid #2e86c1;
-        margin-bottom: 1rem;
+        font-size: 2.5rem; font-weight: 700; color: #1a5276;
+        text-align: center; padding: 1rem 0;
+        border-bottom: 3px solid #2e86c1; margin-bottom: 1rem;
     }
     .sub-header {
-        font-size: 1.2rem;
-        color: #2c3e50;
-        text-align: center;
-        margin-bottom: 2rem;
+        font-size: 1.2rem; color: #2c3e50;
+        text-align: center; margin-bottom: 2rem;
     }
-    .risk-high {
-        background-color: #e74c3c;
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 700;
-    }
-    .risk-intermediate {
-        background-color: #f39c12;
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 700;
-    }
-    .risk-low {
-        background-color: #27ae60;
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 700;
-    }
-    .recommend-ire {
-        background-color: #2e86c1;
-        color: white;
-        padding: 0.5rem 1.5rem;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 1.2rem;
-        text-align: center;
-    }
-    .recommend-rfa {
-        background-color: #27ae60;
-        color: white;
-        padding: 0.5rem 1.5rem;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 1.2rem;
-        text-align: center;
-    }
-    .recommend-either {
-        background-color: #f39c12;
-        color: white;
-        padding: 0.5rem 1.5rem;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 1.2rem;
-        text-align: center;
-    }
-    .heat-phenotype {
-        background-color: #8e44ad;
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 700;
-    }
-    .footer {
-        text-align: center;
-        color: #7f8c8d;
-        font-size: 0.8rem;
-        padding: 1rem 0;
-        border-top: 1px solid #ecf0f1;
-        margin-top: 2rem;
-    }
+    .risk-high { background-color: #e74c3c; color: white; padding: 0.3rem 0.8rem;
+        border-radius: 20px; font-weight: 700; }
+    .risk-intermediate { background-color: #f39c12; color: white; padding: 0.3rem 0.8rem;
+        border-radius: 20px; font-weight: 700; }
+    .risk-low { background-color: #27ae60; color: white; padding: 0.3rem 0.8rem;
+        border-radius: 20px; font-weight: 700; }
+    .recommend-ire { background-color: #2e86c1; color: white; padding: 0.5rem 1.5rem;
+        border-radius: 10px; font-weight: 700; font-size: 1.2rem; text-align: center; }
+    .recommend-rfa { background-color: #27ae60; color: white; padding: 0.5rem 1.5rem;
+        border-radius: 10px; font-weight: 700; font-size: 1.2rem; text-align: center; }
+    .recommend-either { background-color: #f39c12; color: white; padding: 0.5rem 1.5rem;
+        border-radius: 10px; font-weight: 700; font-size: 1.2rem; text-align: center; }
+    .heat-phenotype { background-color: #8e44ad; color: white; padding: 0.3rem 0.8rem;
+        border-radius: 20px; font-weight: 700; }
+    .footer { text-align: center; color: #7f8c8d; font-size: 0.8rem;
+        padding: 1rem 0; border-top: 1px solid #ecf0f1; margin-top: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# 模型定义（含缺失自适应编码器）
+# 模型定义（与术后动态模型一致，支持 postop + IHC 双缺失编码）
 # ============================================================================
 
 class MissingAdaptiveEncoder(nn.Module):
-    """缺失自适应编码器（方案5.2.1）"""
-    def __init__(self, input_dim, preop_dim, postop_dim, hidden_dims=[192, 96, 48], dropout=0.45):
+    def __init__(self, input_dim, preop_dim, postop_dim, ihc_dim=0,
+                 hidden_dims=[192, 96, 48], dropout=0.45):
         super(MissingAdaptiveEncoder, self).__init__()
-        
+
         self.input_dim = input_dim
         self.preop_dim = preop_dim
         self.postop_dim = postop_dim
-        
-        # 可学习的缺失嵌入（仅对术后变量）
-        self.missing_embeddings = nn.Parameter(
-            torch.randn(self.postop_dim, 1) * 0.01
-        )
-        
+        self.ihc_dim = ihc_dim
+
+        if self.postop_dim > 0:
+            self.missing_embeddings = nn.Parameter(
+                torch.randn(self.postop_dim, 1) * 0.01
+            )
+        else:
+            self.register_parameter('missing_embeddings', None)
+
+        if self.ihc_dim > 0:
+            self.ihc_missing_embeddings = nn.Parameter(
+                torch.randn(self.ihc_dim, 1) * 0.01
+            )
+        else:
+            self.register_parameter('ihc_missing_embeddings', None)
+
         self.bn_input = nn.BatchNorm1d(input_dim)
         self.dropout_input = nn.Dropout(0.25)
-        
+
         layers = []
         prev_dim = input_dim
         for i, h_dim in enumerate(hidden_dims):
@@ -151,931 +104,706 @@ class MissingAdaptiveEncoder(nn.Module):
             d_rate = min(0.55, 0.25 + i * 0.1)
             layers.append(nn.Dropout(d_rate))
             prev_dim = h_dim
-        
+
         self.hidden = nn.Sequential(*layers)
         self.output = nn.Linear(prev_dim, 1)
         self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x, mask):
+
+    def forward(self, x, postop_mask, ihc_mask=None):
         batch_size = x.size(0)
-        
         x_preop = x[:, :self.preop_dim]
-        x_postop_vars = x[:, self.preop_dim:self.preop_dim + self.postop_dim]
-        
-        missing_emb_expanded = self.missing_embeddings.squeeze().unsqueeze(0).expand(batch_size, -1)
-        x_postop_encoded = x_postop_vars * mask + (1 - mask) * missing_emb_expanded
-        
-        x_combined = torch.cat([x_preop, x_postop_encoded], dim=1)
-        
+
+        if self.postop_dim > 0:
+            x_postop = x[:, self.preop_dim:self.preop_dim + self.postop_dim]
+            missing_emb = self.missing_embeddings.squeeze().unsqueeze(0).expand(batch_size, -1)
+            x_postop = x_postop * postop_mask + (1 - postop_mask) * missing_emb
+        else:
+            x_postop = x[:, self.preop_dim:self.preop_dim]
+
+        if self.ihc_dim > 0:
+            x_ihc = x[:, self.preop_dim + self.postop_dim:]
+            if ihc_mask is None:
+                ihc_mask = torch.ones_like(x_ihc)
+            ihc_emb = self.ihc_missing_embeddings.squeeze().unsqueeze(0).expand(batch_size, -1)
+            x_ihc = x_ihc * ihc_mask + (1 - ihc_mask) * ihc_emb
+        else:
+            x_ihc = x[:, self.preop_dim + self.postop_dim:]
+
+        parts = [x_preop]
+        if self.postop_dim > 0:
+            parts.append(x_postop)
+        if self.ihc_dim > 0:
+            parts.append(x_ihc)
+        x_combined = torch.cat(parts, dim=1)
+
         x_combined = self.bn_input(x_combined)
         x_combined = self.dropout_input(x_combined)
         x_combined = self.hidden(x_combined)
         x_combined = self.output(x_combined)
-        
+
         return self.sigmoid(x_combined).squeeze(-1)
 
 
-class LIGHTCURE_RFA_Model(nn.Module):
-    """RFA模型架构 - 含缺失自适应编码器"""
-    def __init__(self, input_dim, preop_dim, postop_dim, hidden_dims=[192, 96, 48], dropout=0.45):
-        super(LIGHTCURE_RFA_Model, self).__init__()
-        self.encoder = MissingAdaptiveEncoder(input_dim, preop_dim, postop_dim, hidden_dims, dropout)
-    
-    def forward(self, x, mask):
-        return self.encoder(x, mask)
+class LIGHTCURE_Dynamic_Model(nn.Module):
+    def __init__(self, input_dim, preop_dim, postop_dim, ihc_dim=0,
+                 hidden_dims=[192, 96, 48], dropout=0.45):
+        super(LIGHTCURE_Dynamic_Model, self).__init__()
+        self.encoder = MissingAdaptiveEncoder(
+            input_dim, preop_dim, postop_dim, ihc_dim, hidden_dims, dropout
+        )
 
+    def forward(self, x, postop_mask, ihc_mask=None):
+        return self.encoder(x, postop_mask, ihc_mask)
 
-class LIGHTCURE_IRE_Model(nn.Module):
-    """IRE模型架构 - 含缺失自适应编码器"""
-    def __init__(self, input_dim, preop_dim, postop_dim, hidden_dims=[192, 96, 48], dropout=0.45):
-        super(LIGHTCURE_IRE_Model, self).__init__()
-        self.encoder = MissingAdaptiveEncoder(input_dim, preop_dim, postop_dim, hidden_dims, dropout)
-    
-    def forward(self, x, mask):
-        return self.encoder(x, mask)
 
 # ============================================================================
-# 变量定义（23个变量 + IHC增强）
+# 变量定义（与术后动态模型完全一致）
 # ============================================================================
 
-# 1.1 术前必填变量（14个）
 PREOP_MANDATORY_VARS = [
-    "Etiology", "Preop_AFP", "Number_of_lesions", "Portal_Hypertension",
-    "Arterial_Enhancement_preop", "Maximum_diameter", "Age",
-    "Washout_preop", "Shape_Irregular_preop", "Capsule_Intact_preop",
-    "Margin_Ill_Defined_preop", "US_Echogenicity_Preop", "subcapsular",
-    "CEUS_Pattern_preop"
+    "us_well_defined_margin_preop",
+    "Etiology",
+    "us_enlarged_lymph_nodes_preop",
+    "DWI_High_preop",
+    "Restricted_Diffusion_preop",
+    "Arterial_Enhancement_preop",
+    "location",
+    "us_gallbladder_invasion_preop",
+    "Margin_Ill_Defined_preop",
+    "Number_of_lesions",
+    "Maximum_diameter",
 ]
 
-# 1.2 术后可选变量（9个）
-POSTOP_OPTIONAL_VARS = [
-    "New_Nodule_post6m", "Complete_Ablation_post3m", "Complete_Ablation_post1m",
-    "New_Nodule_post3m", "ALT_Recovery_Ratio_6m", "POD1_AST_Ratio",
-    "Complete_Ablation_post6m", "POD1_NLR", "Post6M_NLR"
+POSTOP_VARS_T1 = [
+    "New_Nodule_post3m",
+    "New_Nodule_Size_mm_post3m",
+    "New_Nodule_Enhancement_post3m",
+    "New_Nodule_Count_post3m",
+    "Margil_Enhancement_post3m",
+    "Arterial_Enhancement_post3m",
 ]
 
-# 1.3 IHC增强变量（12个，有则加）
+POSTOP_VARS_T3 = [
+    "Complete_Ablation_post6m",
+    "Margil_Enhancement_post6m",
+    "New_Nodule_post6m",
+    "New_Nodule_Count_post6m",
+    "New_Nodule_Size_mm_post6m",
+    "New_Nodule_Enhancement_post6m",
+    "Arterial_Enhancement_post6m",
+]
+
 IHC_ENHANCEMENT_VARS = [
-    "HSP70", "HIF_1α", "BCL_2",
-    "Ki_67", "GPC_3", "CK7", "CK19",
-    "E_cadherin", "MMP_9", "VEGF",
-    "CD34", "MVI"
+    "HSP70", "HIF_1α", "BCL_2", "MVI", "E_cadherin", "CK19", "VEGF", "MMP_9"
 ]
 
-ALL_VARS = PREOP_MANDATORY_VARS + POSTOP_OPTIONAL_VARS
+# T3 是 T1 + T3 的合并
+POSTOP_VARS_T3_COMBINED = list(set(POSTOP_VARS_T1 + POSTOP_VARS_T3))
 
-# 变量描述
 VARIABLE_DESCRIPTIONS = {
-    "Etiology": "病因 (HBV, HCV, NAFLD, ALD, 其他)",
-    "Preop_AFP": "术前AFP (ng/mL)",
+    "us_well_defined_margin_preop": "US 边界清晰",
+    "Etiology": "病因",
+    "us_enlarged_lymph_nodes_preop": "US 淋巴结增大",
+    "DWI_High_preop": "DWI 高信号",
+    "Restricted_Diffusion_preop": "弥散受限",
+    "Arterial_Enhancement_preop": "动脉期强化",
+    "location": "肿瘤位置",
+    "us_gallbladder_invasion_preop": "US 胆囊侵犯",
+    "Margin_Ill_Defined_preop": "边界不清",
     "Number_of_lesions": "肿瘤数目",
-    "Portal_Hypertension": "门脉高压 (是/否)",
-    "Arterial_Enhancement_preop": "动脉期强化 (是/否)",
     "Maximum_diameter": "肿瘤最大径 (cm)",
-    "Age": "年龄 (岁)",
-    "Washout_preop": "廓清征 (是/否)",
-    "Shape_Irregular_preop": "形态不规则 (是/否)",
-    "Capsule_Intact_preop": "包膜完整 (是/否)",
-    "Margin_Ill_Defined_preop": "边界不清 (是/否)",
-    "US_Echogenicity_Preop": "超声回声类型",
-    "subcapsular": "包膜下肿瘤 (是/否)",
-    "CEUS_Pattern_preop": "CEUS增强模式",
-    "New_Nodule_post6m": "术后6月新发结节 (是/否)",
-    "Complete_Ablation_post3m": "术后3月完全消融 (是/否)",
-    "Complete_Ablation_post1m": "术后1月完全消融 (是/否)",
-    "New_Nodule_post3m": "术后3月新发结节 (是/否)",
-    "ALT_Recovery_Ratio_6m": "术后6月ALT恢复比率",
-    "POD1_AST_Ratio": "术后1天AST变化率",
-    "Complete_Ablation_post6m": "术后6月完全消融 (是/否)",
-    "POD1_NLR": "术后1天NLR",
-    "Post6M_NLR": "术后6月NLR",
-    "HSP70": "热休克蛋白70 (0-100)",
-    "HIF_1α": "缺氧诱导因子-1α (0-100)",
-    "BCL_2": "B细胞淋巴瘤-2 (0-100)",
-    "Ki_67": "增殖指数 (0-100)",
-    "GPC_3": "磷脂酰肌醇蛋白聚糖-3 (0-100)",
-    "CK7": "细胞角蛋白-7 (0-100)",
-    "CK19": "细胞角蛋白-19 (0-100)",
-    "E_cadherin": "E-钙粘蛋白 (0-100)",
-    "MMP_9": "基质金属蛋白酶-9 (0-100)",
-    "VEGF": "血管内皮生长因子 (0-100)",
-    "CD34": "微血管密度 (0-100)",
-    "MVI": "微血管侵犯 (是/否)"
+
+    "New_Nodule_post3m": "3月新发结节",
+    "New_Nodule_Size_mm_post3m": "3月新结节大小 (mm)",
+    "New_Nodule_Enhancement_post3m": "3月新结节强化",
+    "New_Nodule_Count_post3m": "3月新结节数量",
+    "Margil_Enhancement_post3m": "3月边缘强化",
+    "Arterial_Enhancement_post3m": "3月动脉期强化",
+
+    "Complete_Ablation_post6m": "6月完全消融",
+    "Margil_Enhancement_post6m": "6月边缘强化",
+    "New_Nodule_post6m": "6月新发结节",
+    "New_Nodule_Count_post6m": "6月新结节数量",
+    "New_Nodule_Size_mm_post6m": "6月新结节大小 (mm)",
+    "New_Nodule_Enhancement_post6m": "6月新结节强化",
+    "Arterial_Enhancement_post6m": "6月动脉期强化",
+
+    "HSP70": "HSP70 (0-100)",
+    "HIF_1α": "HIF-1α (0-100)",
+    "BCL_2": "BCL-2 (0-100)",
+    "MVI": "MVI",
+    "E_cadherin": "E-cadherin (0-100)",
+    "CK19": "CK19 (0-100)",
+    "VEGF": "VEGF (0-100)",
+    "MMP_9": "MMP-9 (0-100)",
 }
 
-# 分类变量选项和编码
+# 二分类选项
+BINARY_OPTIONS = ['(缺失)', '否', '是']
+BINARY_ENCODING = {'否': 0, '是': 1}
+
 CATEGORICAL_OPTIONS = {
-    "Etiology": ['HBV', 'HCV', 'NAFLD', 'ALD', '其他'],
-    "Portal_Hypertension": ['否', '是'],
-    "Arterial_Enhancement_preop": ['否', '是'],
-    "Washout_preop": ['否', '是'],
-    "Shape_Irregular_preop": ['否', '是'],
-    "Capsule_Intact_preop": ['否', '是'],
-    "Margin_Ill_Defined_preop": ['否', '是'],
-    "US_Echogenicity_Preop": ['低回声', '等回声', '高回声', '混合'],
-    "subcapsular": ['否', '是'],
-    "CEUS_Pattern_preop": ['其他', '快进快出'],
-    "New_Nodule_post6m": ['否', '是'],
-    "Complete_Ablation_post3m": ['否', '是'],
-    "Complete_Ablation_post1m": ['否', '是'],
-    "New_Nodule_post3m": ['否', '是'],
-    "Complete_Ablation_post6m": ['否', '是'],
-    "MVI": ['否', '是']
+    "us_well_defined_margin_preop": ['(缺失)', '否', '是'],
+    "Etiology": ['(缺失)', 'Other', 'HBV', 'HCV', 'NAFLD', 'ALD'],
+    "us_enlarged_lymph_nodes_preop": ['(缺失)', '否', '是'],
+    "DWI_High_preop": ['(缺失)', '否', '是'],
+    "Restricted_Diffusion_preop": ['(缺失)', '否', '是'],
+    "Arterial_Enhancement_preop": ['(缺失)', '否', '是'],
+    "location": ['(缺失)', 'Left', 'Right', 'Other'],
+    "us_gallbladder_invasion_preop": ['(缺失)', '否', '是'],
+    "Margin_Ill_Defined_preop": ['(缺失)', '否', '是'],
+
+    "New_Nodule_post3m": ['(缺失)', '否', '是'],
+    "New_Nodule_Enhancement_post3m": ['(缺失)', '否', '是'],
+    "Margil_Enhancement_post3m": ['(缺失)', '否', '是'],
+    "Arterial_Enhancement_post3m": ['(缺失)', '否', '是'],
+
+    "Complete_Ablation_post6m": ['(缺失)', '否', '是'],
+    "Margil_Enhancement_post6m": ['(缺失)', '否', '是'],
+    "New_Nodule_post6m": ['(缺失)', '否', '是'],
+    "New_Nodule_Enhancement_post6m": ['(缺失)', '否', '是'],
+    "Arterial_Enhancement_post6m": ['(缺失)', '否', '是'],
+
+    "MVI": ['(缺失)', '否', '是'],
 }
 
 CATEGORICAL_ENCODING = {
-    "Etiology": {'HBV': 1, 'HCV': 2, 'NAFLD': 3, 'ALD': 4, '其他': 0},
-    "US_Echogenicity_Preop": {'低回声': 1, '等回声': 2, '高回声': 3, '混合': 4},
-    "CEUS_Pattern_preop": {'其他': 0, '快进快出': 1},
-    "Portal_Hypertension": {'否': 0, '是': 1},
+    "us_well_defined_margin_preop": {'否': 0, '是': 1},
+    "Etiology": {'Other': 0, 'HBV': 1, 'HCV': 2, 'NAFLD': 3, 'ALD': 4},
+    "us_enlarged_lymph_nodes_preop": {'否': 0, '是': 1},
+    "DWI_High_preop": {'否': 0, '是': 1},
+    "Restricted_Diffusion_preop": {'否': 0, '是': 1},
     "Arterial_Enhancement_preop": {'否': 0, '是': 1},
-    "Washout_preop": {'否': 0, '是': 1},
-    "Shape_Irregular_preop": {'否': 0, '是': 1},
-    "Capsule_Intact_preop": {'否': 0, '是': 1},
+    "location": {'Left': 0, 'Right': 1, 'Other': 2},
+    "us_gallbladder_invasion_preop": {'否': 0, '是': 1},
     "Margin_Ill_Defined_preop": {'否': 0, '是': 1},
-    "subcapsular": {'否': 0, '是': 1},
-    "New_Nodule_post6m": {'否': 0, '是': 1},
-    "Complete_Ablation_post3m": {'否': 0, '是': 1},
-    "Complete_Ablation_post1m": {'否': 0, '是': 1},
+
     "New_Nodule_post3m": {'否': 0, '是': 1},
+    "New_Nodule_Enhancement_post3m": {'否': 0, '是': 1},
+    "Margil_Enhancement_post3m": {'否': 0, '是': 1},
+    "Arterial_Enhancement_post3m": {'否': 0, '是': 1},
+
     "Complete_Ablation_post6m": {'否': 0, '是': 1},
-    "MVI": {'否': 0, '是': 1}
+    "Margil_Enhancement_post6m": {'否': 0, '是': 1},
+    "New_Nodule_post6m": {'否': 0, '是': 1},
+    "New_Nodule_Enhancement_post6m": {'否': 0, '是': 1},
+    "Arterial_Enhancement_post6m": {'否': 0, '是': 1},
+
+    "MVI": {'否': 0, '是': 1},
 }
 
+
 # ============================================================================
-# 模型加载函数
+# 模型加载
 # ============================================================================
 
 @st.cache_resource
 def load_models():
-    """加载模型、标准化器和模型信息"""
-    
-    model_paths = {
-        'rfa': [
-            'models/LIGHTCURE_RFA_23var.pth',
-            '../models/LIGHTCURE_RFA_23var.pth',
-            'LIGHTCURE_RFA_23var.pth',
-        ],
-        'ire': [
-            'models/LIGHTCURE_IRE_23var_Best.pth',
-            '../models/LIGHTCURE_IRE_23var_Best.pth',
-            'LIGHTCURE_IRE_23var_Best.pth',
-        ],
-        'scaler': [
-            'models/scaler_rfa_23var.pkl',
-            '../models/scaler_rfa_23var.pkl',
-            'scaler_rfa_23var.pkl',
-        ],
-        'model_info': [
-            'models/model_info_23var.json',
-            '../models/model_info_23var.json',
-            'model_info_23var.json',
-        ]
-    }
-    
-    def find_file(file_list):
-        for path in file_list:
-            if os.path.exists(path):
-                return path
+    """
+    加载 T0 / T1 / T3 三个时点的模型 + scaler
+    文件名：
+      LIGHTCURE_Dynamic_T0.pth
+      LIGHTCURE_Dynamic_T1.pth
+      LIGHTCURE_Dynamic_T3.pth
+      LIGHTCURE_Dynamic_T0_scaler.pkl
+      LIGHTCURE_Dynamic_T1_scaler.pkl
+      LIGHTCURE_Dynamic_T3_scaler.pkl
+    """
+    MODEL_DIRS = [
+        'models',
+        '../models',
+        '.',
+        r'D:/浙一/Papers/IRE预测模型/最终分析数据',
+    ]
+
+    def find_file(fname):
+        for d in MODEL_DIRS:
+            p = os.path.join(d, fname)
+            if os.path.exists(p):
+                return p
         return None
-    
-    # 加载模型信息
-    info_path = find_file(model_paths['model_info'])
-    if info_path:
-        with open(info_path, 'r') as f:
-            model_info = json.load(f)
-        st.success(f"✅ Model info loaded: {info_path}")
-    else:
-        st.warning("⚠️ Model info not found, using defaults")
-        model_info = {
-            'input_dim': 23,
-            'preop_dim': 14,
-            'postop_dim': 9,
-            'hidden_dims': [192, 96, 48],
-            'dropout': 0.45
-        }
-    
-    input_dim = model_info.get('input_dim', 23)
-    preop_dim = model_info.get('preop_dim', 14)
-    postop_dim = model_info.get('postop_dim', 9)
-    
-    # 加载RFA模型
-    rfa_path = find_file(model_paths['rfa'])
-    if rfa_path is None:
-        st.error("❌ RFA model not found")
-        return None, None, None, None
-    
-    rfa_model = LIGHTCURE_RFA_Model(
-        input_dim=input_dim,
-        preop_dim=preop_dim,
-        postop_dim=postop_dim,
-        hidden_dims=model_info.get('hidden_dims', [192, 96, 48]),
-        dropout=model_info.get('dropout', 0.45)
-    )
-    try:
-        state_dict = torch.load(rfa_path, map_location='cpu', weights_only=False)
-        if hasattr(state_dict, 'state_dict'):
-            state_dict = state_dict.state_dict()
-        rfa_model.load_state_dict(state_dict)
-        rfa_model.eval()
-        st.success(f"✅ RFA model loaded: {rfa_path}")
-    except Exception as e:
-        st.error(f"❌ RFA model load failed: {e}")
-        return None, None, None, None
-    
-    # 加载IRE模型
-    ire_path = find_file(model_paths['ire'])
-    if ire_path is None:
-        st.warning("⚠️ IRE model not found, using RFA as fallback")
-        ire_model = rfa_model
-    else:
-        ire_model = LIGHTCURE_IRE_Model(
-            input_dim=input_dim,
-            preop_dim=preop_dim,
-            postop_dim=postop_dim,
-            hidden_dims=model_info.get('hidden_dims', [192, 96, 48]),
-            dropout=model_info.get('dropout', 0.45)
-        )
+
+    def load_model_at_tp(tp_name, input_dim, preop_dim, postop_dim, ihc_dim):
+        model_path = find_file(f'LIGHTCURE_Dynamic_{tp_name}.pth')
+        scaler_path = find_file(f'LIGHTCURE_Dynamic_{tp_name}_scaler.pkl')
+
+        if model_path is None:
+            return None, None, f"模型文件缺失: LIGHTCURE_Dynamic_{tp_name}.pth"
+        if scaler_path is None:
+            return None, None, f"Scaler 缺失: LIGHTCURE_Dynamic_{tp_name}_scaler.pkl"
+
         try:
-            state_dict = torch.load(ire_path, map_location='cpu', weights_only=False)
+            model = LIGHTCURE_Dynamic_Model(
+                input_dim=input_dim,
+                preop_dim=preop_dim,
+                postop_dim=postop_dim,
+                ihc_dim=ihc_dim,
+                hidden_dims=[192, 96, 48],
+                dropout=0.45
+            )
+            state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
             if hasattr(state_dict, 'state_dict'):
                 state_dict = state_dict.state_dict()
-            ire_model.load_state_dict(state_dict)
-            ire_model.eval()
-            st.success(f"✅ IRE model loaded: {ire_path}")
+            model.load_state_dict(state_dict)
+            model.eval()
+
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+
+            return model, scaler, None
         except Exception as e:
-            st.warning(f"⚠️ IRE model load failed: {e}, using RFA as fallback")
-            ire_model = rfa_model
-    
-    # 加载标准化器
-    scaler_path = find_file(model_paths['scaler'])
-    if scaler_path is None:
-        st.error("❌ Scaler not found")
-        return rfa_model, ire_model, None, model_info
-    else:
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
-        st.success(f"✅ Scaler loaded: {scaler_path}")
-    
-    return rfa_model, ire_model, scaler, model_info
+            return None, None, f"加载失败: {e}"
+
+    # ---- T0 ----
+    preop_dim = len(PREOP_MANDATORY_VARS)
+    ihc_dim = len(IHC_ENHANCEMENT_VARS)
+
+    # T0: 术前 + IHC, postop_dim = 0
+    t0_input_dim = preop_dim + 0 + ihc_dim
+    t0_model, t0_scaler, t0_err = load_model_at_tp(
+        'T0', t0_input_dim, preop_dim, 0, ihc_dim
+    )
+
+    # T1: 术前 + 6 个术后 + IHC
+    t1_postop_dim = len(POSTOP_VARS_T1)
+    t1_input_dim = preop_dim + t1_postop_dim + ihc_dim
+    t1_model, t1_scaler, t1_err = load_model_at_tp(
+        'T1', t1_input_dim, preop_dim, t1_postop_dim, ihc_dim
+    )
+
+    # T3: 术前 + 13 个术后（T1+T3 合并）+ IHC
+    t3_postop_dim = len(POSTOP_VARS_T3_COMBINED)
+    t3_input_dim = preop_dim + t3_postop_dim + ihc_dim
+    t3_model, t3_scaler, t3_err = load_model_at_tp(
+        'T3', t3_input_dim, preop_dim, t3_postop_dim, ihc_dim
+    )
+
+    model_bundle = {
+        'T0': {'model': t0_model, 'scaler': t0_scaler, 'postop_dim': 0,
+               'postop_vars': [], 'err': t0_err},
+        'T1': {'model': t1_model, 'scaler': t1_scaler, 'postop_dim': t1_postop_dim,
+               'postop_vars': POSTOP_VARS_T1, 'err': t1_err},
+        'T3': {'model': t3_model, 'scaler': t3_scaler, 'postop_dim': t3_postop_dim,
+               'postop_vars': POSTOP_VARS_T3_COMBINED, 'err': t3_err},
+    }
+
+    # 状态提示
+    for tp, d in model_bundle.items():
+        if d['model'] is None:
+            st.warning(f"⚠️ {tp} 模型未加载: {d['err']}")
+        else:
+            st.success(f"✅ {tp} 模型加载成功")
+
+    return model_bundle
+
 
 # ============================================================================
-# IHC单独标准化器（独立于主模型）
+# 预测函数（支持 T0 / T1 / T3 三个时点）
 # ============================================================================
 
-@st.cache_resource
-def create_ihc_scaler():
-    """创建IHC特征的单独标准化器"""
-    # 使用合理的范围创建标准化器
-    # 假设IHC值范围0-100，均值为50，标准差为25
-    ihc_scaler = StandardScaler()
-    # 预置参数
-    ihc_scaler.mean_ = np.array([50.0] * len(IHC_ENHANCEMENT_VARS))
-    ihc_scaler.scale_ = np.array([25.0] * len(IHC_ENHANCEMENT_VARS))
-    ihc_scaler.var_ = np.array([625.0] * len(IHC_ENHANCEMENT_VARS))
-    ihc_scaler.n_features_in_ = len(IHC_ENHANCEMENT_VARS)
-    return ihc_scaler
-
-# ============================================================================
-# 预测函数（修复：IHC特征使用单独标准化）
-# ============================================================================
-
-def predict_with_ihc(models, input_dict, scaler):
+def predict_at_timepoint(model_bundle, tp_name, input_dict):
     """
-    进行预测（含IHC增强）
-    
-    IHC特征使用单独的标准化器，不依赖主模型的scaler
+    tp_name: 'T0' / 'T1' / 'T3'
+    input_dict: 用户输入的原始值（类别已编码为 int，缺失为 None）
     """
-    rfa_model, ire_model = models
-    
-    preop_vars = [v for v in PREOP_MANDATORY_VARS if v in ALL_VARS]
-    postop_vars = [v for v in POSTOP_OPTIONAL_VARS if v in ALL_VARS]
-    
-    # ===== 关键修复：IHC变量单独处理，不经过主scaler =====
-    ihc_vars = [v for v in IHC_ENHANCEMENT_VARS if v in input_dict and input_dict.get(v) is not None]
-    
-    # 提取术前变量
-    X_preop = np.array([input_dict.get(v, 0) for v in preop_vars]).reshape(1, -1)
-    
-    # 提取术后变量
-    X_postop = np.array([input_dict.get(v, 0) for v in postop_vars]).reshape(1, -1)
-    
-    # 术后变量缺失指示器
-    mask = np.zeros_like(X_postop)
+    bundle = model_bundle.get(tp_name)
+    if bundle is None or bundle['model'] is None:
+        return None
+
+    model = bundle['model']
+    scaler = bundle['scaler']
+    postop_vars = bundle['postop_vars']
+
+    # ---- 提取术前变量 ----
+    X_preop = np.array([input_dict.get(v, 0) for v in PREOP_MANDATORY_VARS]).reshape(1, -1)
+
+    # ---- 提取术后变量 ----
+    X_postop = np.zeros((1, len(postop_vars)))
+    postop_mask = np.zeros((1, len(postop_vars)))
     for i, v in enumerate(postop_vars):
-        if v in input_dict and input_dict.get(v) is not None and not pd.isna(input_dict.get(v)):
-            mask[0, i] = 1.0
-    
-    # ===== 关键修复：标准化基础特征（23个）=====
-    X_base = np.concatenate([X_preop, X_postop], axis=1)
-    X_base_scaled = scaler.transform(X_base)
-    
-    # ===== 关键修复：IHC特征单独标准化 =====
-    if ihc_vars:
-        ihc_scaler = create_ihc_scaler()
-        # 构建IHC特征向量（保持12维，缺失用0填充）
-        X_ihc_raw = np.zeros((1, len(IHC_ENHANCEMENT_VARS)))
-        for i, v in enumerate(IHC_ENHANCEMENT_VARS):
-            if v in ihc_vars:
-                val = input_dict.get(v, 0)
-                if not pd.isna(val):
-                    X_ihc_raw[0, i] = val
-        # 标准化IHC特征
-        X_ihc_scaled = ihc_scaler.transform(X_ihc_raw)
-        # 合并
-        X_combined = np.concatenate([X_base_scaled, X_ihc_scaled], axis=1)
-        ihc_available = True
-        ihc_count = len(ihc_vars)
-    else:
-        X_combined = X_base_scaled
-        ihc_available = False
-        ihc_count = 0
-    
-    # 转换为张量（注意：模型期望的输入维度是基础23维）
-    # 模型只接受23维输入，IHC特征作为增强信息不进入模型
-    X_tensor = torch.FloatTensor(X_base_scaled)
-    mask_tensor = torch.FloatTensor(mask)
-    
-    # 预测
+        val = input_dict.get(v, None)
+        if val is not None and not pd.isna(val):
+            X_postop[0, i] = val
+            postop_mask[0, i] = 1.0
+
+    # ---- 提取 IHC 变量 ----
+    X_ihc = np.zeros((1, len(IHC_ENHANCEMENT_VARS)))
+    ihc_mask = np.zeros((1, len(IHC_ENHANCEMENT_VARS)))
+    for i, v in enumerate(IHC_ENHANCEMENT_VARS):
+        val = input_dict.get(v, None)
+        if val is not None and not pd.isna(val):
+            X_ihc[0, i] = val
+            ihc_mask[0, i] = 1.0
+
+    # ---- 合并原始特征 ----
+    X_raw = np.concatenate([X_preop, X_postop, X_ihc], axis=1)
+
+    # ---- 标准化（scaler 是按完整维度拟合的）----
+    X_scaled = scaler.transform(X_raw)
+
+    # ---- 送入模型 ----
+    X_tensor = torch.FloatTensor(X_scaled)
+    pm_tensor = torch.FloatTensor(postop_mask)
+    im_tensor = torch.FloatTensor(ihc_mask)
+
     with torch.no_grad():
-        P_RFA = rfa_model(X_tensor, mask_tensor).numpy().flatten()
-        P_IRE = ire_model(X_tensor, mask_tensor).numpy().flatten()
-    
-    delta_P = P_RFA - P_IRE
-    
-    # 风险分组
-    p_rfa = P_RFA[0]
-    if p_rfa < 0.2:
+        prob = model(X_tensor, pm_tensor, im_tensor).numpy().flatten()
+
+    prob = float(np.clip(prob[0], 1e-6, 1 - 1e-6))
+
+    # ---- 风险分层（与主模型一致）----
+    if prob < 0.2:
         risk_group = 'Low'
-    elif p_rfa < 0.5:
+    elif prob < 0.5:
         risk_group = 'Intermediate'
     else:
         risk_group = 'High'
-    
-    # 治疗推荐
-    dp = delta_P[0]
-    if dp > 0.05:
-        recommendation = 'IRE'
-        recommendation_detail = f"ΔP > 0.05: IRE may reduce LTP risk by {dp*100:.1f}%"
-    elif dp < -0.05:
-        recommendation = 'RFA'
-        recommendation_detail = f"ΔP < -0.05: RFA may reduce LTP risk by {-dp*100:.1f}%"
-    else:
-        recommendation = 'Either'
-        recommendation_detail = "ΔP near 0: Similar expected outcomes"
-    
-    # 热耐受表型评估
-    heat_markers_present = []
-    heat_score = 0
-    heat_markers_count = 0
-    
-    for m in ['HSP70', 'HIF_1α', 'BCL_2']:
-        if m in input_dict and input_dict.get(m) is not None and not pd.isna(input_dict.get(m)):
-            val = input_dict.get(m, 0)
-            heat_markers_present.append(m)
-            heat_score += val
-            heat_markers_count += 1
-    
-    if heat_markers_count >= 3:
-        heat_score_avg = heat_score / 3
-        if heat_score_avg > 50:
-            heat_phenotype = 'Positive (High)'
-        else:
-            heat_phenotype = 'Negative (Low)'
-    elif heat_markers_count > 0:
-        heat_score_avg = heat_score / heat_markers_count
-        if heat_score_avg > 50:
-            heat_phenotype = f'Partial Positive (n={heat_markers_count})'
-        else:
-            heat_phenotype = f'Partial Negative (n={heat_markers_count})'
-    else:
-        heat_phenotype = 'Not Available'
-        heat_score_avg = None
-    
-    # 数据完整度评分
+
+    # ---- 数据完整度 ----
+    n_postop = int(postop_mask.sum())
+    n_ihc = int(ihc_mask.sum())
     total_postop = len(postop_vars)
-    available_postop = mask.sum()
     total_ihc = len(IHC_ENHANCEMENT_VARS)
-    available_ihc = ihc_count
     total_vars = total_postop + total_ihc
-    available_vars = available_postop + available_ihc
-    completeness = (available_vars / total_vars * 100) if total_vars > 0 else 100
-    
-    if completeness >= 80:
-        confidence = '★★★★★'
-        confidence_label = 'High'
-    elif completeness >= 60:
-        confidence = '★★★★'
-        confidence_label = 'Moderate-High'
-    elif completeness >= 40:
-        confidence = '★★★'
-        confidence_label = 'Moderate'
+    available_vars = n_postop + n_ihc
+    completeness = (available_vars / total_vars * 100) if total_vars > 0 else 100.0
+
+    # ---- IHC 热耐受表型 ----
+    heat_present = []
+    heat_sum = 0
+    for m in ['HSP70', 'HIF_1α', 'BCL_2']:
+        val = input_dict.get(m, None)
+        if val is not None and not pd.isna(val):
+            heat_present.append(m)
+            heat_sum += val
+    if len(heat_present) >= 3:
+        heat_avg = heat_sum / 3
+        heat_phenotype = 'Positive (High)' if heat_avg > 50 else 'Negative (Low)'
+    elif len(heat_present) > 0:
+        heat_avg = heat_sum / len(heat_present)
+        heat_phenotype = f'Partial (n={len(heat_present)})'
     else:
-        confidence = '★★'
-        confidence_label = 'Low'
-    
+        heat_avg = None
+        heat_phenotype = 'Not Available'
+
     return {
-        'P_RFA': float(P_RFA[0]),
-        'P_IRE': float(P_IRE[0]),
-        'delta_P': float(delta_P[0]),
+        'P_LTP': prob,
         'risk_group': risk_group,
-        'recommendation': recommendation,
-        'recommendation_detail': recommendation_detail,
-        'heat_phenotype': heat_phenotype,
-        'heat_markers_present': heat_markers_present,
-        'heat_score_avg': heat_score_avg,
-        'ihc_available': ihc_available,
-        'ihc_count': ihc_count,
-        'completeness': float(completeness),
-        'confidence': confidence,
-        'confidence_label': confidence_label,
-        'available_postop': int(available_postop),
+        'completeness': completeness,
+        'n_postop': n_postop,
         'total_postop': total_postop,
-        'available_ihc': available_ihc,
-        'total_ihc': total_ihc
+        'n_ihc': n_ihc,
+        'total_ihc': total_ihc,
+        'heat_phenotype': heat_phenotype,
+        'heat_markers_present': heat_present,
+        'heat_score_avg': heat_avg,
     }
 
+
 # ============================================================================
-# 渲染函数
+# 输入表单
 # ============================================================================
 
 def render_input_form():
-    """渲染输入表单"""
-    
-    st.markdown("## 📋 Patient Information Input")
-    st.caption("🟥 Required (Preop) | 🟩 Optional (Postop) | 🟪 IHC Enhancement (Optional)")
-    
-    tab1, tab2, tab3 = st.tabs(["🟥 Preoperative (Required)", "🟩 Postoperative (Optional)", "🟪 IHC Enhancement (Optional)"])
-    
+    st.markdown("## 📋 Patient Information")
+    st.caption("术前 11 变量 + 术后变量 + IHC 变量，全部允许缺失（缺失值走缺失嵌入）")
+
+    tab1, tab2, tab3 = st.tabs(["🟥 术前 (必填)", "🟩 术后 (可选)", "🟪 IHC (可选)"])
+
     input_dict = {}
-    
+
+    # ---------------- 术前 ----------------
     with tab1:
-        st.markdown("### 🟥 Preoperative Features (Required)")
-        
+        st.markdown("### 🟥 术前变量（11 个）")
         col1, col2 = st.columns(2)
-        
+
         with col1:
-            age = st.number_input("Age (years)", min_value=18, max_value=85, value=55)
-            input_dict['Age'] = age
-            
-            etiology = st.selectbox("Etiology", options=CATEGORICAL_OPTIONS['Etiology'], index=0)
-            input_dict['Etiology'] = CATEGORICAL_ENCODING['Etiology'][etiology]
-            
-            afp = st.number_input("Preop AFP (ng/mL)", min_value=0.0, max_value=100000.0, value=10.0, step=1.0)
-            input_dict['Preop_AFP'] = afp
-            
-            num_lesions = st.number_input("Number of Lesions", min_value=1, max_value=10, value=1)
-            input_dict['Number_of_lesions'] = num_lesions
-            
-            max_diameter = st.number_input("Maximum Diameter (cm)", min_value=0.1, max_value=5.0, value=2.0, step=0.1)
-            input_dict['Maximum_diameter'] = max_diameter
-            
-            portal_hypertension = st.selectbox("Portal Hypertension", options=CATEGORICAL_OPTIONS['Portal_Hypertension'], index=0)
-            input_dict['Portal_Hypertension'] = CATEGORICAL_ENCODING['Portal_Hypertension'][portal_hypertension]
-            
-            arterial_enhancement = st.selectbox("Arterial Enhancement", options=CATEGORICAL_OPTIONS['Arterial_Enhancement_preop'], index=1)
-            input_dict['Arterial_Enhancement_preop'] = CATEGORICAL_ENCODING['Arterial_Enhancement_preop'][arterial_enhancement]
-        
+            max_d = st.number_input("Maximum Diameter (cm)",
+                                    min_value=0.1, max_value=15.0,
+                                    value=2.0, step=0.1)
+            input_dict['Maximum_diameter'] = max_d
+
+            n_lesion = st.number_input("Number of Lesions",
+                                       min_value=1, max_value=20, value=1)
+            input_dict['Number_of_lesions'] = n_lesion
+
+            etiology = st.selectbox("Etiology",
+                                    options=CATEGORICAL_OPTIONS['Etiology'],
+                                    index=0)
+            if etiology != '(缺失)':
+                input_dict['Etiology'] = CATEGORICAL_ENCODING['Etiology'][etiology]
+
+            location = st.selectbox("Location",
+                                    options=CATEGORICAL_OPTIONS['location'],
+                                    index=0)
+            if location != '(缺失)':
+                input_dict['location'] = CATEGORICAL_ENCODING['location'][location]
+
+            margin_ill = st.selectbox("Margin Ill-defined",
+                                      options=CATEGORICAL_OPTIONS['Margin_Ill_Defined_preop'],
+                                      index=0)
+            if margin_ill != '(缺失)':
+                input_dict['Margin_Ill_Defined_preop'] = CATEGORICAL_ENCODING['Margin_Ill_Defined_preop'][margin_ill]
+
         with col2:
-            washout = st.selectbox("Washout", options=CATEGORICAL_OPTIONS['Washout_preop'], index=0)
-            input_dict['Washout_preop'] = CATEGORICAL_ENCODING['Washout_preop'][washout]
-            
-            shape_irregular = st.selectbox("Irregular Shape", options=CATEGORICAL_OPTIONS['Shape_Irregular_preop'], index=0)
-            input_dict['Shape_Irregular_preop'] = CATEGORICAL_ENCODING['Shape_Irregular_preop'][shape_irregular]
-            
-            capsule_intact = st.selectbox("Intact Capsule", options=CATEGORICAL_OPTIONS['Capsule_Intact_preop'], index=0)
-            input_dict['Capsule_Intact_preop'] = CATEGORICAL_ENCODING['Capsule_Intact_preop'][capsule_intact]
-            
-            margin_ill_defined = st.selectbox("Ill-defined Margin", options=CATEGORICAL_OPTIONS['Margin_Ill_Defined_preop'], index=0)
-            input_dict['Margin_Ill_Defined_preop'] = CATEGORICAL_ENCODING['Margin_Ill_Defined_preop'][margin_ill_defined]
-            
-            us_echogenicity = st.selectbox("US Echogenicity", options=CATEGORICAL_OPTIONS['US_Echogenicity_Preop'], index=0)
-            input_dict['US_Echogenicity_Preop'] = CATEGORICAL_ENCODING['US_Echogenicity_Preop'][us_echogenicity]
-            
-            subcapsular = st.selectbox("Subcapsular", options=CATEGORICAL_OPTIONS['subcapsular'], index=0)
-            input_dict['subcapsular'] = CATEGORICAL_ENCODING['subcapsular'][subcapsular]
-            
-            ceus_pattern = st.selectbox("CEUS Pattern", options=CATEGORICAL_OPTIONS['CEUS_Pattern_preop'], index=0)
-            input_dict['CEUS_Pattern_preop'] = CATEGORICAL_ENCODING['CEUS_Pattern_preop'][ceus_pattern]
-    
+            us_margin = st.selectbox("US Well-defined Margin",
+                                     options=CATEGORICAL_OPTIONS['us_well_defined_margin_preop'],
+                                     index=0)
+            if us_margin != '(缺失)':
+                input_dict['us_well_defined_margin_preop'] = CATEGORICAL_ENCODING['us_well_defined_margin_preop'][us_margin]
+
+            dwi = st.selectbox("DWI High",
+                               options=CATEGORICAL_OPTIONS['DWI_High_preop'], index=0)
+            if dwi != '(缺失)':
+                input_dict['DWI_High_preop'] = CATEGORICAL_ENCODING['DWI_High_preop'][dwi]
+
+            rest = st.selectbox("Restricted Diffusion",
+                                options=CATEGORICAL_OPTIONS['Restricted_Diffusion_preop'], index=0)
+            if rest != '(缺失)':
+                input_dict['Restricted_Diffusion_preop'] = CATEGORICAL_ENCODING['Restricted_Diffusion_preop'][rest]
+
+            art = st.selectbox("Arterial Enhancement",
+                               options=CATEGORICAL_OPTIONS['Arterial_Enhancement_preop'], index=0)
+            if art != '(缺失)':
+                input_dict['Arterial_Enhancement_preop'] = CATEGORICAL_ENCODING['Arterial_Enhancement_preop'][art]
+
+            ln = st.selectbox("US Enlarged LN",
+                              options=CATEGORICAL_OPTIONS['us_enlarged_lymph_nodes_preop'], index=0)
+            if ln != '(缺失)':
+                input_dict['us_enlarged_lymph_nodes_preop'] = CATEGORICAL_ENCODING['us_enlarged_lymph_nodes_preop'][ln]
+
+            gb = st.selectbox("US Gallbladder Invasion",
+                              options=CATEGORICAL_OPTIONS['us_gallbladder_invasion_preop'], index=0)
+            if gb != '(缺失)':
+                input_dict['us_gallbladder_invasion_preop'] = CATEGORICAL_ENCODING['us_gallbladder_invasion_preop'][gb]
+
+    # ---------------- 术后 ----------------
     with tab2:
-        st.markdown("### 🟩 Postoperative Features (Optional)")
-        st.caption("Leave blank if not available")
-        
+        st.markdown("### 🟩 术后变量（可选，全部允许缺失）")
+        st.caption("术后 3 月变量 + 术后 6 月变量")
+
+        st.markdown("**--- 术后 3 月变量 ---**")
         col1, col2 = st.columns(2)
-        
         with col1:
-            new_nodule_6m = st.selectbox("New Nodule at 6 Months", options=CATEGORICAL_OPTIONS['New_Nodule_post6m'], index=1)
-            if new_nodule_6m != '':
-                input_dict['New_Nodule_post6m'] = CATEGORICAL_ENCODING['New_Nodule_post6m'][new_nodule_6m]
-            
-            complete_ablation_3m = st.selectbox("Complete Ablation at 3 Months", options=CATEGORICAL_OPTIONS['Complete_Ablation_post3m'], index=0)
-            if complete_ablation_3m != '':
-                input_dict['Complete_Ablation_post3m'] = CATEGORICAL_ENCODING['Complete_Ablation_post3m'][complete_ablation_3m]
-            
-            complete_ablation_1m = st.selectbox("Complete Ablation at 1 Month", options=CATEGORICAL_OPTIONS['Complete_Ablation_post1m'], index=0)
-            if complete_ablation_1m != '':
-                input_dict['Complete_Ablation_post1m'] = CATEGORICAL_ENCODING['Complete_Ablation_post1m'][complete_ablation_1m]
-            
-            new_nodule_3m = st.selectbox("New Nodule at 3 Months", options=CATEGORICAL_OPTIONS['New_Nodule_post3m'], index=1)
-            if new_nodule_3m != '':
-                input_dict['New_Nodule_post3m'] = CATEGORICAL_ENCODING['New_Nodule_post3m'][new_nodule_3m]
-            
-            complete_ablation_6m = st.selectbox("Complete Ablation at 6 Months", options=CATEGORICAL_OPTIONS['Complete_Ablation_post6m'], index=0)
-            if complete_ablation_6m != '':
-                input_dict['Complete_Ablation_post6m'] = CATEGORICAL_ENCODING['Complete_Ablation_post6m'][complete_ablation_6m]
-        
+            v = st.selectbox("New Nodule @3m",
+                             options=CATEGORICAL_OPTIONS['New_Nodule_post3m'], index=0)
+            if v != '(缺失)':
+                input_dict['New_Nodule_post3m'] = CATEGORICAL_ENCODING['New_Nodule_post3m'][v]
+
+            v = st.number_input("New Nodule Size @3m (mm)",
+                                min_value=0.0, max_value=200.0,
+                                value=None, step=1.0)
+            if v is not None:
+                input_dict['New_Nodule_Size_mm_post3m'] = v
+
+            v = st.selectbox("New Nodule Enhancement @3m",
+                             options=CATEGORICAL_OPTIONS['New_Nodule_Enhancement_post3m'], index=0)
+            if v != '(缺失)':
+                input_dict['New_Nodule_Enhancement_post3m'] = CATEGORICAL_ENCODING['New_Nodule_Enhancement_post3m'][v]
+
         with col2:
-            alt_recovery_ratio = st.number_input("ALT Recovery Ratio (6 Months)", min_value=0.0, max_value=5.0, value=None, step=0.1)
-            if alt_recovery_ratio is not None:
-                input_dict['ALT_Recovery_Ratio_6m'] = alt_recovery_ratio
-            
-            pod1_ast_ratio = st.number_input("POD1 AST Ratio", min_value=0.0, max_value=5.0, value=None, step=0.1)
-            if pod1_ast_ratio is not None:
-                input_dict['POD1_AST_Ratio'] = pod1_ast_ratio
-            
-            pod1_nlr = st.number_input("POD1 NLR", min_value=0.0, max_value=20.0, value=None, step=0.1)
-            if pod1_nlr is not None:
-                input_dict['POD1_NLR'] = pod1_nlr
-            
-            post6m_nlr = st.number_input("Post6M NLR", min_value=0.0, max_value=20.0, value=None, step=0.1)
-            if post6m_nlr is not None:
-                input_dict['Post6M_NLR'] = post6m_nlr
-    
+            v = st.number_input("New Nodule Count @3m",
+                                min_value=0, max_value=50, value=None, step=1)
+            if v is not None:
+                input_dict['New_Nodule_Count_post3m'] = v
+
+            v = st.selectbox("Marginal Enhancement @3m",
+                             options=CATEGORICAL_OPTIONS['Margil_Enhancement_post3m'], index=0)
+            if v != '(缺失)':
+                input_dict['Margil_Enhancement_post3m'] = CATEGORICAL_ENCODING['Margil_Enhancement_post3m'][v]
+
+            v = st.selectbox("Arterial Enhancement @3m",
+                             options=CATEGORICAL_OPTIONS['Arterial_Enhancement_post3m'], index=0)
+            if v != '(缺失)':
+                input_dict['Arterial_Enhancement_post3m'] = CATEGORICAL_ENCODING['Arterial_Enhancement_post3m'][v]
+
+        st.markdown("**--- 术后 6 月变量 ---**")
+        col1, col2 = st.columns(2)
+        with col1:
+            v = st.selectbox("Complete Ablation @6m",
+                             options=CATEGORICAL_OPTIONS['Complete_Ablation_post6m'], index=0)
+            if v != '(缺失)':
+                input_dict['Complete_Ablation_post6m'] = CATEGORICAL_ENCODING['Complete_Ablation_post6m'][v]
+
+            v = st.selectbox("Marginal Enhancement @6m",
+                             options=CATEGORICAL_OPTIONS['Margil_Enhancement_post6m'], index=0)
+            if v != '(缺失)':
+                input_dict['Margil_Enhancement_post6m'] = CATEGORICAL_ENCODING['Margil_Enhancement_post6m'][v]
+
+            v = st.selectbox("New Nodule @6m",
+                             options=CATEGORICAL_OPTIONS['New_Nodule_post6m'], index=0)
+            if v != '(缺失)':
+                input_dict['New_Nodule_post6m'] = CATEGORICAL_ENCODING['New_Nodule_post6m'][v]
+
+            v = st.number_input("New Nodule Count @6m",
+                                min_value=0, max_value=50, value=None, step=1)
+            if v is not None:
+                input_dict['New_Nodule_Count_post6m'] = v
+
+        with col2:
+            v = st.number_input("New Nodule Size @6m (mm)",
+                                min_value=0.0, max_value=200.0,
+                                value=None, step=1.0)
+            if v is not None:
+                input_dict['New_Nodule_Size_mm_post6m'] = v
+
+            v = st.selectbox("New Nodule Enhancement @6m",
+                             options=CATEGORICAL_OPTIONS['New_Nodule_Enhancement_post6m'], index=0)
+            if v != '(缺失)':
+                input_dict['New_Nodule_Enhancement_post6m'] = CATEGORICAL_ENCODING['New_Nodule_Enhancement_post6m'][v]
+
+            v = st.selectbox("Arterial Enhancement @6m",
+                             options=CATEGORICAL_OPTIONS['Arterial_Enhancement_post6m'], index=0)
+            if v != '(缺失)':
+                input_dict['Arterial_Enhancement_post6m'] = CATEGORICAL_ENCODING['Arterial_Enhancement_post6m'][v]
+
+    # ---------------- IHC ----------------
     with tab3:
-        st.markdown("### 🟪 IHC Enhancement (Optional)")
-        st.caption("Enter IHC marker values if available")
-        st.info("💡 **Key markers for heat phenotype:** HSP70, HIF-1α, BCL-2")
-        
+        st.markdown("### 🟪 IHC 变量（可选，全部允许缺失）")
         col1, col2 = st.columns(2)
-        
         with col1:
-            st.markdown("**Core Markers (Heat Phenotype)**")
-            
-            hsp70 = st.number_input("HSP70 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if hsp70 is not None:
-                input_dict['HSP70'] = hsp70
-            
-            hif1a = st.number_input("HIF-1α (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if hif1a is not None:
-                input_dict['HIF_1α'] = hif1a
-            
-            bcl2 = st.number_input("BCL-2 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if bcl2 is not None:
-                input_dict['BCL_2'] = bcl2
-            
-            st.markdown("---")
-            st.markdown("**Proliferation Markers**")
-            
-            ki67 = st.number_input("Ki-67 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if ki67 is not None:
-                input_dict['Ki_67'] = ki67
-            
-            gpc3 = st.number_input("GPC-3 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if gpc3 is not None:
-                input_dict['GPC_3'] = gpc3
-        
+            for v in ['HSP70', 'HIF_1α', 'BCL_2', 'E_cadherin']:
+                val = st.number_input(VARIABLE_DESCRIPTIONS[v],
+                                      min_value=0.0, max_value=100.0,
+                                      value=None, step=1.0, key=f'ihc_{v}')
+                if val is not None:
+                    input_dict[v] = val
+
         with col2:
-            st.markdown("**Cytokeratin Markers**")
-            
-            ck7 = st.number_input("CK7 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if ck7 is not None:
-                input_dict['CK7'] = ck7
-            
-            ck19 = st.number_input("CK19 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if ck19 is not None:
-                input_dict['CK19'] = ck19
-            
-            st.markdown("---")
-            st.markdown("**Invasion & Angiogenesis Markers**")
-            
-            e_cadherin = st.number_input("E-cadherin (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if e_cadherin is not None:
-                input_dict['E_cadherin'] = e_cadherin
-            
-            mmp9 = st.number_input("MMP-9 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if mmp9 is not None:
-                input_dict['MMP_9'] = mmp9
-            
-            vegf = st.number_input("VEGF (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if vegf is not None:
-                input_dict['VEGF'] = vegf
-            
-            cd34 = st.number_input("CD34 (0-100)", min_value=0.0, max_value=100.0, value=None, step=1.0)
-            if cd34 is not None:
-                input_dict['CD34'] = cd34
-            
-            mvi = st.selectbox("MVI (Microvascular Invasion)", options=CATEGORICAL_OPTIONS['MVI'], index=0)
-            if mvi != '':
+            for v in ['CK19', 'VEGF', 'MMP_9']:
+                val = st.number_input(VARIABLE_DESCRIPTIONS[v],
+                                      min_value=0.0, max_value=100.0,
+                                      value=None, step=1.0, key=f'ihc_{v}')
+                if val is not None:
+                    input_dict[v] = val
+
+            mvi = st.selectbox("MVI", options=CATEGORICAL_OPTIONS['MVI'], index=0, key='mvi_sel')
+            if mvi != '(缺失)':
                 input_dict['MVI'] = CATEGORICAL_ENCODING['MVI'][mvi]
-    
+
     return input_dict
 
-def render_results(results, input_dict):
-    """渲染结果展示"""
-    
-    st.markdown("## 📊 Prediction Results")
-    
-    # 数据完整度
-    st.info(f"📊 Data Completeness: {results['completeness']:.0f}% | "
-            f"Postop: {results['available_postop']}/{results['total_postop']} | "
-            f"IHC: {results['available_ihc']}/{results['total_ihc']} | "
-            f"Confidence: {results['confidence']} ({results['confidence_label']})")
-    
-    # 热耐受表型
-    if results['heat_phenotype'] != 'Not Available':
-        phenotype_html = f'<span class="heat-phenotype">🔥 Heat Phenotype: {results["heat_phenotype"]}</span>'
-        st.markdown(phenotype_html, unsafe_allow_html=True)
-        if results['heat_markers_present']:
-            st.caption(f"Markers: {', '.join(results['heat_markers_present'])} (Avg: {results['heat_score_avg']:.1f})")
-    else:
-        st.caption("⚠️ Heat phenotype: Insufficient IHC markers (need HSP70, HIF-1α, BCL-2)")
-    
-    # 风险评分
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("RFA Predicted LTP Probability", f"{results['P_RFA']*100:.1f}%")
-    
-    with col2:
-        st.metric("IRE Predicted LTP Probability", f"{results['P_IRE']*100:.1f}%")
-    
-    with col3:
-        st.metric("ΔP (RFA - IRE)", f"{results['delta_P']*100:+.1f}%")
-    
-    # 风险分组和推荐
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        risk_group = results['risk_group']
-        if risk_group == 'Low':
-            risk_html = f'<span class="risk-low">🟢 Low Risk</span>'
-        elif risk_group == 'Intermediate':
-            risk_html = f'<span class="risk-intermediate">🟡 Intermediate Risk</span>'
-        else:
-            risk_html = f'<span class="risk-high">🔴 High Risk</span>'
-        
-        st.markdown("### Risk Group")
-        st.markdown(risk_html, unsafe_allow_html=True)
-        st.caption("Thresholds: Low < 0.2, Intermediate 0.2-0.5, High ≥ 0.5")
-    
-    with col2:
-        recommendation = results['recommendation']
-        if recommendation == 'IRE':
-            rec_html = f'<div class="recommend-ire">💡 Recommended: IRE</div>'
-        elif recommendation == 'RFA':
-            rec_html = f'<div class="recommend-rfa">💡 Recommended: RFA</div>'
-        else:
-            rec_html = f'<div class="recommend-either">💡 Either technique</div>'
-        
-        st.markdown("### Treatment Recommendation")
-        st.markdown(rec_html, unsafe_allow_html=True)
-        st.caption(results['recommendation_detail'])
-    
-    # 输入数据摘要
-    with st.expander("📋 View Input Data"):
-        all_vars_display = PREOP_MANDATORY_VARS + POSTOP_OPTIONAL_VARS + IHC_ENHANCEMENT_VARS
-        data_rows = []
-        for v in all_vars_display:
-            if v in input_dict and input_dict.get(v) is not None and not pd.isna(input_dict.get(v)):
-                val = input_dict.get(v)
-                if v in CATEGORICAL_ENCODING:
-                    for key, code in CATEGORICAL_ENCODING[v].items():
-                        if code == val:
-                            val = f"{val} ({key})"
-                            break
-                data_rows.append({'Variable': VARIABLE_DESCRIPTIONS.get(v, v), 'Value': val})
-        input_df = pd.DataFrame(data_rows)
-        st.dataframe(input_df, use_container_width=True)
-
-def generate_pdf_report(results, input_dict):
-    """生成PDF报告"""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
-    from reportlab.lib.units import cm
-    
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-    
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=18, spaceAfter=30, alignment=1)
-    story.append(Paragraph("LIGHTCURE Treatment Decision Report", title_style))
-    story.append(Spacer(1, 20))
-    
-    story.append(Paragraph(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    story.append(Paragraph("Prediction Results", styles['Heading2']))
-    story.append(Spacer(1, 10))
-    
-    result_data = [
-        ["Metric", "Value"],
-        ["RFA Predicted LTP Probability", f"{results['P_RFA']*100:.1f}%"],
-        ["IRE Predicted LTP Probability", f"{results['P_IRE']*100:.1f}%"],
-        ["ΔP (RFA - IRE)", f"{results['delta_P']*100:+.1f}%"],
-        ["Risk Group", results['risk_group']],
-        ["Treatment Recommendation", results['recommendation']],
-        ["Heat Phenotype", results['heat_phenotype']],
-        ["Data Completeness", f"{results['completeness']:.0f}% ({results['confidence']})"]
-    ]
-    
-    result_table = Table(result_data, colWidths=[250, 150])
-    result_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(result_table)
-    story.append(Spacer(1, 30))
-    
-    story.append(Paragraph("Input Data", styles['Heading2']))
-    story.append(Spacer(1, 10))
-    
-    input_data = [["Variable", "Value"]]
-    for key, value in input_dict.items():
-        display_key = VARIABLE_DESCRIPTIONS.get(key, key)
-        if key in CATEGORICAL_ENCODING:
-            for k, code in CATEGORICAL_ENCODING[key].items():
-                if code == value:
-                    value = k
-                    break
-        input_data.append([display_key, str(value)])
-    
-    input_table = Table(input_data, colWidths=[300, 100])
-    input_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
-    ]))
-    story.append(input_table)
-    story.append(Spacer(1, 30))
-    
-    story.append(Paragraph("Disclaimer", styles['Heading2']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(
-        "This report is generated by the LIGHTCURE Decision Support System for clinical reference only. "
-        "The final treatment decision should be made by the clinician based on comprehensive patient assessment.",
-        styles['Normal']
-    ))
-    
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
 
 # ============================================================================
-# 主应用
+# 结果渲染
+# ============================================================================
+
+def render_timepoint_result(tp_name, res):
+    if res is None:
+        st.warning(f"{tp_name} 模型未加载，无法预测")
+        return
+
+    st.markdown(f"### {tp_name} 时点预测结果")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Predicted LTP Probability", f"{res['P_LTP']*100:.1f}%")
+    with col2:
+        rg = res['risk_group']
+        if rg == 'Low':
+            st.markdown('<span class="risk-low">🟢 Low Risk</span>', unsafe_allow_html=True)
+        elif rg == 'Intermediate':
+            st.markdown('<span class="risk-intermediate">🟡 Intermediate</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="risk-high">🔴 High Risk</span>', unsafe_allow_html=True)
+    with col3:
+        st.metric("Completeness", f"{res['completeness']:.0f}%")
+
+    if res['heat_phenotype'] != 'Not Available':
+        st.markdown(f'<span class="heat-phenotype">🔥 Heat Phenotype: {res["heat_phenotype"]}</span>',
+                    unsafe_allow_html=True)
+        if res['heat_markers_present']:
+            st.caption(f"Markers: {', '.join(res['heat_markers_present'])} "
+                       f"(Avg: {res['heat_score_avg']:.1f})")
+
+
+def render_results(model_bundle, input_dict):
+    st.markdown("## 📊 Prediction Results")
+
+    # 判断可用的时点
+    t0 = predict_at_timepoint(model_bundle, 'T0', input_dict)
+    t1 = predict_at_timepoint(model_bundle, 'T1', input_dict)
+    t3 = predict_at_timepoint(model_bundle, 'T3', input_dict)
+
+    tab0, tab1, tab3_ = st.tabs(["T0 (术前)", "T1 (术后 3 月)", "T3 (术后 6 月)"])
+
+    with tab0:
+        render_timepoint_result('T0', t0)
+    with tab1:
+        render_timepoint_result('T1', t1)
+    with tab3_:
+        render_timepoint_result('T3', t3)
+
+    st.markdown("---")
+    st.markdown("### 时点对比")
+
+    rows = []
+    for tp, r in [('T0 (术前)', t0), ('T1 (术后 3 月)', t1), ('T3 (术后 6 月)', t3)]:
+        if r is not None:
+            rows.append({
+                'Timepoint': tp,
+                'Predicted LTP': f"{r['P_LTP']*100:.1f}%",
+                'Risk Group': r['risk_group'],
+                'Completeness': f"{r['completeness']:.0f}%",
+            })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+# ============================================================================
+# 主程序
 # ============================================================================
 
 def main():
-    """主应用函数"""
-    
     st.markdown('<div class="main-header">🏥 LIGHTCURE</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">'
-        'HCC Ablation Therapy Individualized Decision Support System<br>'
-        '<small>肝细胞癌消融治疗个体化决策支持系统</small>'
+        'Postoperative Dynamic Monitoring System<br>'
+        '<small>术后动态监测系统</small>'
         '</div>',
         unsafe_allow_html=True
     )
-    
-    # 侧边栏
+
     with st.sidebar:
         st.markdown("## ℹ️ About")
         st.markdown("""
-        **LIGHTCURE** is a deep learning-based decision support system for HCC ablation therapy.
-        
-        **Features:**
-        - Predicts LTP probability for RFA and IRE
-        - Calculates individualized ΔP benefit score
-        - Provides treatment recommendation
-        - **IHC Enhancement**: HSP70, HIF-1α, BCL-2 heat phenotype
-        - Handles missing postoperative variables
-        
-        **Privacy:**
-        - All computation performed locally
-        - No patient data stored
+        **LIGHTCURE-Dynamic** 是一个基于深度学习的术后动态监测系统。
+
+        **核心设计：**
+        - **T0**：术前 11 变量 + IHC
+        - **T1**：术前 + 术后 3 月变量 + IHC
+        - **T3**：术前 + 术后 3 月 + 6 月变量 + IHC
+
+        **特性：**
+        - IHC 和术后变量都允许缺失（走缺失嵌入）
+        - 缺失越多，预测置信度越低
+        - 自动显示热耐受表型（HSP70/HIF-1α/BCL-2）
+
+        **隐私：**
+        - 所有计算在本地进行
+        - 不存储患者数据
         """)
-        
         st.markdown("---")
-        st.markdown("### 📁 Batch Prediction")
-        
-        uploaded_file = st.file_uploader("Upload CSV for batch prediction", type=['csv'])
-        if uploaded_file is not None:
-            try:
-                df_batch = pd.read_csv(uploaded_file)
-                st.success(f"✅ Loaded {len(df_batch)} records")
-                st.session_state.batch_data = df_batch
-            except Exception as e:
-                st.error(f"❌ Failed to load: {e}")
-        
-        st.markdown("---")
-        st.markdown("### 📄 Report")
-        if 'results' in st.session_state:
-            if st.button("📥 Download PDF Report"):
-                try:
-                    pdf_buffer = generate_pdf_report(st.session_state.results, st.session_state.input_dict)
-                    st.download_button(
-                        label="Download Report",
-                        data=pdf_buffer,
-                        file_name=f"LIGHTCURE_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                        mime="application/pdf"
-                    )
-                except Exception as e:
-                    st.error(f"Report generation failed: {e}")
-        
-        st.markdown("---")
-        st.markdown("### 🔧 Model Info")
-        if 'model_info' in st.session_state:
-            info = st.session_state.model_info
-            st.caption(f"Input features: {info.get('input_dim', 23)}")
-            st.caption(f"IHC features: up to {len(IHC_ENHANCEMENT_VARS)} (optional)")
-            st.caption(f"Version: v2.0")
-    
-    # 加载模型
-    if 'models_loaded' not in st.session_state:
-        with st.spinner("⏳ Loading models..."):
-            rfa_model, ire_model, scaler, model_info = load_models()
-            if rfa_model is not None and scaler is not None:
-                st.session_state.rfa_model = rfa_model
-                st.session_state.ire_model = ire_model
-                st.session_state.scaler = scaler
-                st.session_state.models_loaded = True
-                st.session_state.model_info = model_info
-            else:
-                st.error("❌ Model loading failed")
-                return
-    
-    # 批量预测
-    if 'batch_data' in st.session_state and st.session_state.batch_data is not None:
-        st.markdown("## 📊 Batch Prediction Results")
-        df_batch = st.session_state.batch_data
-        
-        missing_cols = [v for v in ALL_VARS if v not in df_batch.columns]
-        if missing_cols:
-            st.error(f"❌ Missing columns: {missing_cols}")
-        else:
-            results_batch = []
-            for _, row in df_batch.iterrows():
-                input_dict = {v: row[v] for v in ALL_VARS}
-                for ihc_var in IHC_ENHANCEMENT_VARS:
-                    if ihc_var in df_batch.columns and not pd.isna(row[ihc_var]):
-                        input_dict[ihc_var] = row[ihc_var]
-                result = predict_with_ihc(
-                    (st.session_state.rfa_model, st.session_state.ire_model),
-                    input_dict,
-                    st.session_state.scaler
-                )
-                results_batch.append(result)
-            
-            df_results = pd.DataFrame(results_batch)
-            st.dataframe(df_results, use_container_width=True)
-            
-            csv = df_results.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Results CSV",
-                data=csv,
-                file_name=f"LIGHTCURE_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
-        
-        if st.button("🔄 Back to Single Prediction"):
-            del st.session_state.batch_data
-            st.rerun()
-        return
-    
-    # 单例预测
+
+    if 'model_bundle' not in st.session_state:
+        with st.spinner("⏳ 加载模型中..."):
+            bundle = load_models()
+            st.session_state.model_bundle = bundle
+            st.session_state.models_loaded = True
+
     input_dict = render_input_form()
-    
+
     if st.button("🚀 Predict", type="primary", use_container_width=True):
         try:
-            results = predict_with_ihc(
-                (st.session_state.rfa_model, st.session_state.ire_model),
-                input_dict,
-                st.session_state.scaler
-            )
-            st.session_state.results = results
-            st.session_state.input_dict = input_dict
-            render_results(results, input_dict)
+            render_results(st.session_state.model_bundle, input_dict)
         except Exception as e:
             st.error(f"❌ Prediction failed: {e}")
             st.exception(e)
-    
+
     st.markdown("---")
     st.markdown("""
     <div class="footer">
-        LIGHTCURE v2.0 | For clinical research use only | No patient data stored
+        LIGHTCURE-Dynamic v4.0 | For clinical research use only | No patient data stored
     </div>
     """, unsafe_allow_html=True)
 
