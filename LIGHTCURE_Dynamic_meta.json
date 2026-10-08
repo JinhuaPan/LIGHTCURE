@@ -1,0 +1,71 @@
+{
+  "preop_vars": [
+    "us_well_defined_margin_preop",
+    "Etiology",
+    "us_enlarged_lymph_nodes_preop",
+    "DWI_High_preop",
+    "Restricted_Diffusion_preop",
+    "Arterial_Enhancement_preop",
+    "location",
+    "us_gallbladder_invasion_preop",
+    "Margin_Ill_Defined_preop",
+    "Number_of_lesions",
+    "Maximum_diameter"
+  ],
+  "postop_vars_T1": [
+    "New_Nodule_post3m",
+    "New_Nodule_Size_mm_post3m",
+    "New_Nodule_Enhancement_post3m",
+    "New_Nodule_Count_post3m",
+    "Margil_Enhancement_post3m",
+    "Arterial_Enhancement_post3m"
+  ],
+  "postop_vars_T3_combined": [
+    "New_Nodule_Size_mm_post6m",
+    "Arterial_Enhancement_post6m",
+    "Margil_Enhancement_post6m",
+    "New_Nodule_post6m",
+    "New_Nodule_Enhancement_post3m",
+    "New_Nodule_Size_mm_post3m",
+    "Arterial_Enhancement_post3m",
+    "New_Nodule_Count_post6m",
+    "Complete_Ablation_post6m",
+    "New_Nodule_Count_post3m",
+    "New_Nodule_Enhancement_post6m",
+    "New_Nodule_post3m",
+    "Margil_Enhancement_post3m"
+  ],
+  "ihc_vars": [
+    "HSP70",
+    "HIF_1α",
+    "BCL_2",
+    "MVI",
+    "E_cadherin",
+    "CK19",
+    "VEGF",
+    "MMP_9"
+  ],
+  "timepoints": {
+    "T0": {
+      "input_dim": 19,
+      "preop_dim": 11,
+      "postop_dim": 0,
+      "ihc_dim": 8,
+      "best_val_auc": 0.7787884615384616
+    },
+    "T1": {
+      "input_dim": 25,
+      "preop_dim": 11,
+      "postop_dim": 6,
+      "ihc_dim": 8,
+      "best_val_auc": 0.9230598231487428
+    },
+    "T3": {
+      "input_dim": 32,
+      "preop_dim": 11,
+      "postop_dim": 13,
+      "ihc_dim": 8,
+      "best_val_auc": 0.9495346168557949
+    }
+  }
+}
