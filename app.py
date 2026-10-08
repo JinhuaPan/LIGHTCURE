@@ -296,7 +296,6 @@ CATEGORICAL_ENCODING = {
 # ============================================================================
 # 模型加载
 # ============================================================================
-
 @st.cache_resource
 def load_models():
     """
@@ -309,20 +308,47 @@ def load_models():
       LIGHTCURE_Dynamic_T1_scaler.pkl
       LIGHTCURE_Dynamic_T3_scaler.pkl
     """
+    import os
+
+    # ---- 用 app.py 所在目录为锚点 ----
+    try:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        BASE_DIR = os.getcwd()
+
     MODEL_DIRS = [
-        'models',
-        '../models',
+        os.path.join(BASE_DIR, 'models'),      # 仓库根目录/models（推荐）
+        BASE_DIR,                               # 仓库根目录
+        'models',                               # 相对路径 fallback
         '.',
-        r'D:/浙一/Papers/IRE预测模型/最终分析数据',
+        '../models',
+        r'D:/浙一/Papers/IRE预测模型/最终分析数据',   # 本地开发用
     ]
+
+    # ---- 打印诊断信息（部署后可在 Logs 里看） ----
+    print("=" * 60)
+    print("BASE_DIR:", BASE_DIR)
+    try:
+        print("Files in BASE_DIR:", os.listdir(BASE_DIR))
+    except Exception:
+        pass
+    models_dir = os.path.join(BASE_DIR, 'models')
+    if os.path.exists(models_dir):
+        print("Files in models/:", os.listdir(models_dir))
+    else:
+        print("No 'models/' directory found in BASE_DIR")
+    print("=" * 60)
 
     def find_file(fname):
         for d in MODEL_DIRS:
+            if d is None:
+                continue
             p = os.path.join(d, fname)
             if os.path.exists(p):
                 return p
         return None
 
+    # ---- 加载每个时点的模型 ----
     def load_model_at_tp(tp_name, input_dim, preop_dim, postop_dim, ihc_dim):
         model_path = find_file(f'LIGHTCURE_Dynamic_{tp_name}.pth')
         scaler_path = find_file(f'LIGHTCURE_Dynamic_{tp_name}_scaler.pkl')
@@ -344,6 +370,13 @@ def load_models():
             state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
             if hasattr(state_dict, 'state_dict'):
                 state_dict = state_dict.state_dict()
+
+            # ---- 兼容 float16 保存 ----
+            state_dict = {
+                k: (v.float() if v.dtype == torch.float16 else v)
+                for k, v in state_dict.items()
+            }
+
             model.load_state_dict(state_dict)
             model.eval()
 
@@ -357,21 +390,19 @@ def load_models():
     # ---- T0 ----
     preop_dim = len(PREOP_MANDATORY_VARS)
     ihc_dim = len(IHC_ENHANCEMENT_VARS)
-
-    # T0: 术前 + IHC, postop_dim = 0
     t0_input_dim = preop_dim + 0 + ihc_dim
     t0_model, t0_scaler, t0_err = load_model_at_tp(
         'T0', t0_input_dim, preop_dim, 0, ihc_dim
     )
 
-    # T1: 术前 + 6 个术后 + IHC
+    # ---- T1 ----
     t1_postop_dim = len(POSTOP_VARS_T1)
     t1_input_dim = preop_dim + t1_postop_dim + ihc_dim
     t1_model, t1_scaler, t1_err = load_model_at_tp(
         'T1', t1_input_dim, preop_dim, t1_postop_dim, ihc_dim
     )
 
-    # T3: 术前 + 13 个术后（T1+T3 合并）+ IHC
+    # ---- T3 ----
     t3_postop_dim = len(POSTOP_VARS_T3_COMBINED)
     t3_input_dim = preop_dim + t3_postop_dim + ihc_dim
     t3_model, t3_scaler, t3_err = load_model_at_tp(
@@ -387,7 +418,6 @@ def load_models():
                'postop_vars': POSTOP_VARS_T3_COMBINED, 'err': t3_err},
     }
 
-    # 状态提示
     for tp, d in model_bundle.items():
         if d['model'] is None:
             st.warning(f"⚠️ {tp} 模型未加载: {d['err']}")
